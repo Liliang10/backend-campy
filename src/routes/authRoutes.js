@@ -9,5 +9,6 @@ router.post('/staff-login', authController.staffLogin);
 router.post('/refresh', authController.refreshSession);
 router.get('/profile', requireAuth, authController.getProfile);
 router.put('/profile', requireAuth, authController.updateProfile);
+router.post('/change-password', requireAuth, authController.changePassword);
 
 module.exports = router;

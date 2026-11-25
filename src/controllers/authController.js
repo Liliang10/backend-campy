@@ -337,7 +337,7 @@ async function getProfile(req, res) {
     const userId = req.user.id;
     const client = req.supabase || supabase;
     const userRole = req.userRole || req.user.user_metadata?.role || 'user';
-    const targetTable = userRole === 'admin' ? 'admin' : (userRole === 'petugas' ? 'petugas' : 'users');
+    const targetTable = req.userTable || (['admin', 'super_admin', 'superadmin'].includes(userRole) ? 'admin' : (userRole === 'petugas' ? 'petugas' : 'users'));
 
     const { data, error } = await client
       .from(targetTable)
@@ -347,6 +347,8 @@ async function getProfile(req, res) {
 
     const metaName = req.user.user_metadata?.name || '';
     const metaPhone = req.user.user_metadata?.phone || '';
+    const metaDetail = req.user.user_metadata?.detail || '';
+    const metaLocation = req.user.user_metadata?.location || '';
 
     // If query returned error (e.g. table column id not yet created in remote DB), return fallback gracefully
     if (error) {
@@ -358,18 +360,21 @@ async function getProfile(req, res) {
           email: req.user.email,
           full_name: metaName,
           name: metaName,
+          username: metaName,
           phone: metaPhone,
           role: userRole,
           address: '',
           avatar_url: null,
-          detail: '',
-          location: '',
+          detail: metaDetail,
+          location: metaLocation,
         },
       });
     }
 
     const full_name = data?.full_name || data?.name || data?.username || metaName || '';
     const phone = data?.phone || metaPhone || '';
+    const detail = data?.detail || metaDetail || '';
+    const location = data?.location || metaLocation || '';
 
     return res.status(200).json({
       success: true,
@@ -378,12 +383,13 @@ async function getProfile(req, res) {
         email: data?.email || req.user.email,
         full_name,
         name: full_name,
+        username: data?.username || full_name,
         phone,
         role: userRole,
         address: data?.address || '',
         avatar_url: data?.avatar_url || null,
-        detail: data?.detail || '',
-        location: data?.location || '',
+        detail,
+        location,
       },
     });
   } catch (err) {
@@ -404,14 +410,14 @@ async function updateProfile(req, res) {
     const userId = req.user.id;
     const client = req.supabase || supabase;
     const userRole = req.userRole || req.user.user_metadata?.role || 'user';
-    const targetTable = userRole === 'admin' ? 'admin' : (userRole === 'petugas' ? 'petugas' : 'users');
-    const { full_name, name, phone, address, avatar_url, detail, location } = req.body;
+    const targetTable = req.userTable || (['admin', 'super_admin', 'superadmin'].includes(userRole) ? 'admin' : (userRole === 'petugas' ? 'petugas' : 'users'));
+    const { full_name, name, username, phone, address, avatar_url, detail, location, new_password, password } = req.body;
 
     const updates = {
       updated_at: new Date().toISOString(),
     };
 
-    const newName = full_name !== undefined ? full_name : name;
+    const newName = full_name !== undefined ? full_name : (name !== undefined ? name : username);
     if (newName !== undefined) {
       if (targetTable === 'users') {
         updates.full_name = newName;
@@ -427,8 +433,39 @@ async function updateProfile(req, res) {
 
     if (targetTable === 'users') {
       if (address !== undefined) updates.address = address;
-      if (avatar_url !== undefined) updates.avatar_url = avatar_url;
     }
+    if (avatar_url !== undefined) updates.avatar_url = avatar_url;
+
+    // Handle password change if provided
+    const changePassword = new_password || password;
+    if (changePassword) {
+      if (String(changePassword).length < 6) {
+        return res.status(400).json({
+          success: false,
+          message: 'Password baru minimal harus 6 karakter.',
+        });
+      }
+      try {
+        const { error: pwdErr } = await client.auth.updateUser({ password: String(changePassword) });
+        if (pwdErr && supabase.auth.admin?.updateUserById) {
+          await supabase.auth.admin.updateUserById(userId, { password: String(changePassword) });
+        }
+      } catch (pwdCatch) {
+        console.warn('Password change catch in updateProfile:', pwdCatch.message);
+      }
+    }
+
+    // Also update auth user metadata for seamless sync
+    try {
+      const metaUpdates = {};
+      if (newName !== undefined) metaUpdates.name = newName;
+      if (phone !== undefined) metaUpdates.phone = phone;
+      if (detail !== undefined) metaUpdates.detail = detail;
+      if (location !== undefined) metaUpdates.location = location;
+      if (Object.keys(metaUpdates).length > 0) {
+        await client.auth.updateUser({ data: metaUpdates });
+      }
+    } catch (_) {}
 
     const { data, error } = await client
       .from(targetTable)
@@ -447,11 +484,13 @@ async function updateProfile(req, res) {
           id: userId,
           email: req.user.email,
           full_name: newName || req.user.user_metadata?.name || '',
-          phone: phone || '',
+          name: newName || req.user.user_metadata?.name || '',
+          username: newName || req.user.user_metadata?.name || '',
+          phone: phone !== undefined ? phone : (req.user.user_metadata?.phone || ''),
           address: address || '',
           avatar_url: avatar_url || null,
-          detail: detail || '',
-          location: location || '',
+          detail: detail !== undefined ? detail : (req.user.user_metadata?.detail || ''),
+          location: location !== undefined ? location : (req.user.user_metadata?.location || ''),
           role: userRole,
         },
       });
@@ -464,11 +503,13 @@ async function updateProfile(req, res) {
         id: userId,
         email: data?.email || req.user.email,
         full_name: data?.full_name || data?.name || data?.username || newName || '',
-        phone: data?.phone || '',
-        address: data?.address || '',
-        avatar_url: data?.avatar_url || null,
-        detail: data?.detail || '',
-        location: data?.location || '',
+        name: data?.name || data?.username || data?.full_name || newName || '',
+        username: data?.username || data?.name || data?.full_name || newName || '',
+        phone: data?.phone || phone || '',
+        address: data?.address || address || '',
+        avatar_url: data?.avatar_url || avatar_url || null,
+        detail: data?.detail || detail || '',
+        location: data?.location || location || '',
         role: userRole,
       },
     });
@@ -481,6 +522,57 @@ async function updateProfile(req, res) {
   }
 }
 
+/**
+ * Change current user password
+ * POST /api/auth/change-password
+ * Body: { old_password, new_password }
+ */
+async function changePassword(req, res) {
+  try {
+    const userId = req.user.id;
+    const client = req.supabase || supabase;
+    const { new_password } = req.body;
+
+    if (!new_password || String(new_password).length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password baru minimal harus 6 karakter.',
+      });
+    }
+
+    const { error } = await client.auth.updateUser({ password: String(new_password) });
+    if (error) {
+      if (supabase.auth.admin?.updateUserById) {
+        const { error: adminErr } = await supabase.auth.admin.updateUserById(userId, {
+          password: String(new_password),
+        });
+        if (adminErr) {
+          return res.status(400).json({
+            success: false,
+            message: 'Gagal memperbarui kata sandi: ' + adminErr.message,
+          });
+        }
+      } else {
+        return res.status(400).json({
+          success: false,
+          message: 'Gagal memperbarui kata sandi: ' + error.message,
+        });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Kata sandi berhasil diperbarui.',
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: 'Terjadi kesalahan saat memperbarui kata sandi.',
+      error: err.message,
+    });
+  }
+}
+
 module.exports = {
   register,
   login,
@@ -488,4 +580,5 @@ module.exports = {
   refreshSession,
   getProfile,
   updateProfile,
+  changePassword,
 };

@@ -103,6 +103,11 @@ create table if not exists public.orders (
   status text default 'active' check (status in ('active', 'completed', 'cancelled')),
   location text,
   payment_method text,
+  rental_duration_days int not null default 1,
+  return_deadline date,
+  return_photo_url text,
+  return_status text not null default 'not_submitted'
+    check (return_status in ('not_submitted', 'pending_review', 'approved', 'rejected')),
   created_at timestamptz default now()
 );
 
@@ -112,6 +117,30 @@ alter table public.orders add column if not exists qty int default 1;
 alter table public.orders add column if not exists unit_price int default 0;
 alter table public.orders add column if not exists subtotal int default 0;
 alter table public.orders add column if not exists delivery_fee int default 0;
+alter table public.orders add column if not exists rental_duration_days int not null default 1;
+alter table public.orders add column if not exists return_deadline date;
+alter table public.orders add column if not exists return_photo_url text;
+alter table public.orders add column if not exists return_status text not null default 'not_submitted';
+
+update public.orders
+   set return_deadline = (created_at at time zone 'Asia/Jakarta')::date + rental_duration_days
+ where return_deadline is null
+   and created_at is not null;
+
+do $$
+begin
+  if not exists (
+    select 1
+      from pg_constraint
+     where conname = 'orders_return_status_check'
+       and conrelid = 'public.orders'::regclass
+  ) then
+    alter table public.orders
+      add constraint orders_return_status_check
+      check (return_status in ('not_submitted', 'pending_review', 'approved', 'rejected'));
+  end if;
+end;
+$$;
 
 -- 3.3 ORDER_ITEMS
 create table if not exists public.order_items (
@@ -220,13 +249,16 @@ create trigger on_auth_user_created
   for each row execute function public.handle_new_user();
 
 -- 5.3 RPC ATOMIK: create_order
+drop function if exists public.create_order(jsonb, text, text, text, text, text);
+
 create or replace function public.create_order(
   p_items jsonb,
   p_delivery_method text default 'pickup',
   p_payment_method text default 'BCA',
   p_delivery_address text default null,
   p_order_id text default null,
-  p_date text default null
+  p_date text default null,
+  p_rental_duration_days int default 1
 )
 returns jsonb as $$
 declare
@@ -236,6 +268,7 @@ declare
   v_delivery_fee int := 0;
   v_total int := 0;
   v_order_date text;
+  v_return_deadline date;
   v_location text;
   v_item jsonb;
   v_prod_id text;
@@ -259,6 +292,12 @@ begin
     raise exception 'Pesanan harus memiliki minimal 1 item.';
   end if;
 
+  if p_rental_duration_days is null or p_rental_duration_days < 1 or p_rental_duration_days > 365 then
+    raise exception 'Durasi sewa harus antara 1 sampai 365 hari.';
+  end if;
+
+  v_return_deadline := (now() at time zone 'Asia/Jakarta')::date + p_rental_duration_days;
+
   -- Ongkos kirim
   if p_delivery_method = 'delivery' then
     v_delivery_fee := 20000;
@@ -279,7 +318,7 @@ begin
   if p_date is not null and p_date <> '' then
     v_order_date := p_date;
   else
-    v_order_date := to_char(now(), 'DD/MM/YYYY') || ' – ' || to_char(now() + interval '2 days', 'DD/MM/YYYY');
+    v_order_date := to_char((now() at time zone 'Asia/Jakarta')::date, 'DD/MM/YYYY') || ' – ' || to_char(v_return_deadline, 'DD/MM/YYYY');
   end if;
 
   -- Loop item: lock stok, validasi, kurangi stok, hitung harga dari DB
@@ -336,6 +375,8 @@ begin
     status,
     location,
     payment_method,
+    rental_duration_days,
+    return_deadline,
     created_at
   ) values (
     v_order_id,
@@ -352,6 +393,8 @@ begin
     'active',
     v_location,
     p_payment_method,
+    p_rental_duration_days,
+    v_return_deadline,
     now()
   )
   returning * into v_res_order;
@@ -400,11 +443,93 @@ begin
     'status', v_res_order.status,
     'location', v_res_order.location,
     'payment_method', v_res_order.payment_method,
+    'rental_duration_days', v_res_order.rental_duration_days,
+    'return_deadline', v_res_order.return_deadline,
+    'return_photo_url', v_res_order.return_photo_url,
+    'return_status', v_res_order.return_status,
     'created_at', v_res_order.created_at,
     'items', v_created_items
   );
 end;
 $$ language plpgsql security definer;
+
+create or replace function public.submit_order_return(
+  p_order_id text,
+  p_photo_url text
+)
+returns jsonb as $$
+declare
+  v_order public.orders;
+begin
+  if auth.uid() is null then
+    raise exception 'Akses ditolak: pengguna belum login.';
+  end if;
+  if p_photo_url is null or btrim(p_photo_url) = '' then
+    raise exception 'Foto pengembalian wajib diunggah.';
+  end if;
+
+  select * into v_order
+    from public.orders
+   where id = p_order_id
+     and user_id = auth.uid()
+   for update;
+
+  if not found then
+    raise exception 'Pesanan tidak ditemukan atau bukan milik Anda.';
+  end if;
+  if v_order.status <> 'active' then
+    raise exception 'Pengembalian hanya dapat diajukan untuk pesanan aktif.';
+  end if;
+  if v_order.return_status = 'pending_review' or v_order.return_status = 'approved' then
+    raise exception 'Foto pengembalian sudah diajukan atau telah dikonfirmasi.';
+  end if;
+
+  update public.orders
+     set return_photo_url = p_photo_url,
+         return_status = 'pending_review'
+   where id = p_order_id
+   returning * into v_order;
+
+  return to_jsonb(v_order);
+end;
+$$ language plpgsql security definer set search_path = public, auth;
+
+create or replace function public.review_order_return(
+  p_order_id text,
+  p_decision text
+)
+returns jsonb as $$
+declare
+  v_order public.orders;
+begin
+  if public.current_user_role() not in ('admin', 'super_admin', 'superadmin', 'petugas') then
+    raise exception 'Hanya petugas yang dapat mengonfirmasi pengembalian.';
+  end if;
+  if p_decision not in ('approved', 'rejected') then
+    raise exception 'Keputusan harus approved atau rejected.';
+  end if;
+
+  select * into v_order
+    from public.orders
+   where id = p_order_id
+   for update;
+
+  if not found then
+    raise exception 'Pesanan tidak ditemukan.';
+  end if;
+  if v_order.return_status <> 'pending_review' or v_order.return_photo_url is null then
+    raise exception 'Pesanan tidak memiliki pengajuan pengembalian yang menunggu konfirmasi.';
+  end if;
+
+  update public.orders
+     set return_status = p_decision,
+         status = case when p_decision = 'approved' then 'completed' else 'active' end
+   where id = p_order_id
+   returning * into v_order;
+
+  return to_jsonb(v_order);
+end;
+$$ language plpgsql security definer set search_path = public, auth;
 
 -- ==============================================================================
 -- 6. ROW LEVEL SECURITY (RLS)

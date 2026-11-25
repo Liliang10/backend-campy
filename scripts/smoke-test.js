@@ -134,6 +134,7 @@ async function run() {
       body: JSON.stringify({
         deliveryMethod: 'pickup',
         paymentMethod: 'BCA',
+        rentalDurationDays: 3,
         items: [{ productId: testProdId, qty: 1 }],
       }),
     });
@@ -142,6 +143,9 @@ async function run() {
       console.warn('Order create error details:', orderData);
     }
     assert(orderRes.status === 201 && orderData.data?.id, `POST /api/orders: order ID ${orderData.data?.id}`);
+    const createdDuration = orderData.data?.rental_duration_days ?? orderData.data?.rentalDurationDays;
+    const createdDeadline = orderData.data?.return_deadline ?? orderData.data?.returnDeadline;
+    assert(createdDuration === 3 && createdDeadline, `POST /api/orders: 3-day rental deadline ${createdDeadline}`);
 
     const orderId = orderData.data?.id;
     if (orderId) {
@@ -162,6 +166,7 @@ async function run() {
       const getOrdersRes = await fetch(`${baseUrl}/api/orders`, { headers: authHeaders });
       const getOrdersData = await getOrdersRes.json();
       assert(getOrdersRes.status === 200 && getOrdersData.data?.some(o => o.id === orderId), `GET /api/orders: contains created order`);
+      assert(getOrdersData.data?.some(o => o.id === orderId && o.rentalDurationDays === 3 && o.returnDeadline), `GET /api/orders: includes rental duration and return deadline`);
 
       // 12. Fetch transactions list
       const getTrxRes = await fetch(`${baseUrl}/api/transactions`, { headers: authHeaders });

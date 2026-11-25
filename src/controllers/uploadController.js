@@ -41,6 +41,79 @@ const upload = multer({
  * with automatic fallback to local static storage
  * POST /api/upload
  */
+async function storeImage(file, req, prefix = 'product') {
+  let ext = path.extname(file.originalname || '').toLowerCase();
+  if (!ext || ext === '') {
+    if (file.mimetype === 'image/png') ext = '.png';
+    else if (file.mimetype === 'image/webp') ext = '.webp';
+    else ext = '.jpg';
+  }
+
+  const filename = `${prefix}-${crypto.randomUUID()}${ext}`;
+  const contentType = file.mimetype === 'application/octet-stream'
+      ? (ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg')
+      : file.mimetype;
+
+  // 1. Always save a copy locally to public/uploads as guaranteed fallback
+  const localFilePath = path.join(uploadsDir, filename);
+  try {
+    fs.writeFileSync(localFilePath, file.buffer);
+  } catch (fsErr) {
+    console.warn('Failed to save local image backup:', fsErr.message);
+  }
+
+  const localUrl = `${req.protocol}://${req.get('host')}/uploads/${filename}`;
+
+  // 2. Try uploading to Supabase Storage bucket 'product-images'
+  let publicUrl = null;
+  const client = req.supabase || supabase;
+
+  try {
+    const { data, error } = await client.storage
+      .from('product-images')
+      .upload(filename, file.buffer, {
+        contentType,
+        upsert: true,
+      });
+
+    if (!error && data) {
+      const { data: publicUrlData } = client.storage
+        .from('product-images')
+        .getPublicUrl(filename);
+      if (publicUrlData?.publicUrl) {
+        publicUrl = publicUrlData.publicUrl;
+      }
+    } else {
+      // If user client failed with RLS, attempt with supabase default client
+      const retry = await supabase.storage
+        .from('product-images')
+        .upload(filename, file.buffer, {
+          contentType,
+          upsert: true,
+        });
+
+      if (!retry.error) {
+        const { data: retryUrlData } = supabase.storage
+          .from('product-images')
+          .getPublicUrl(filename);
+        if (retryUrlData?.publicUrl) {
+          publicUrl = retryUrlData.publicUrl;
+        }
+      } else {
+        console.warn('Supabase storage upload failed, using local URL fallback:', retry.error.message);
+      }
+    }
+  } catch (storageErr) {
+    console.warn('Supabase storage exception, using local URL fallback:', storageErr.message);
+  }
+
+  // 3. Use public Supabase URL if available, otherwise local URL
+  return {
+    url: publicUrl || localUrl,
+    filename,
+  };
+}
+
 async function uploadImage(req, res) {
   try {
     if (!req.file) {
@@ -50,79 +123,12 @@ async function uploadImage(req, res) {
       });
     }
 
-    let ext = path.extname(req.file.originalname || '').toLowerCase();
-    if (!ext || ext === '') {
-      if (req.file.mimetype === 'image/png') ext = '.png';
-      else if (req.file.mimetype === 'image/webp') ext = '.webp';
-      else ext = '.jpg';
-    }
-
-    const filename = `product-${crypto.randomUUID()}${ext}`;
-    const contentType = req.file.mimetype === 'application/octet-stream'
-      ? (ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg')
-      : req.file.mimetype;
-
-    // 1. Always save a copy locally to public/uploads as guaranteed fallback
-    const localFilePath = path.join(uploadsDir, filename);
-    try {
-      fs.writeFileSync(localFilePath, req.file.buffer);
-    } catch (fsErr) {
-      console.warn('Failed to save local image backup:', fsErr.message);
-    }
-
-    const localUrl = `${req.protocol}://${req.get('host')}/uploads/${filename}`;
-
-    // 2. Try uploading to Supabase Storage bucket 'product-images'
-    let publicUrl = null;
-    const client = req.supabase || supabase;
-
-    try {
-      const { data, error } = await client.storage
-        .from('product-images')
-        .upload(filename, req.file.buffer, {
-          contentType,
-          upsert: true,
-        });
-
-      if (!error && data) {
-        const { data: publicUrlData } = client.storage
-          .from('product-images')
-          .getPublicUrl(filename);
-        if (publicUrlData?.publicUrl) {
-          publicUrl = publicUrlData.publicUrl;
-        }
-      } else {
-        // If user client failed with RLS, attempt with supabase default client
-        const retry = await supabase.storage
-          .from('product-images')
-          .upload(filename, req.file.buffer, {
-            contentType,
-            upsert: true,
-          });
-
-        if (!retry.error) {
-          const { data: retryUrlData } = supabase.storage
-            .from('product-images')
-            .getPublicUrl(filename);
-          if (retryUrlData?.publicUrl) {
-            publicUrl = retryUrlData.publicUrl;
-          }
-        } else {
-          console.warn('Supabase storage upload failed, using local URL fallback:', retry.error.message);
-        }
-      }
-    } catch (storageErr) {
-      console.warn('Supabase storage exception, using local URL fallback:', storageErr.message);
-    }
-
-    // 3. Use public Supabase URL if available, otherwise local URL
-    const finalUrl = publicUrl || localUrl;
-
+    const { url, filename } = await storeImage(req.file, req);
     return res.status(200).json({
       success: true,
       message: 'Gambar berhasil diunggah.',
       data: {
-        url: finalUrl,
+        url,
         filename,
       },
     });
@@ -138,5 +144,6 @@ async function uploadImage(req, res) {
 
 module.exports = {
   upload,
+  storeImage,
   uploadImage,
 };

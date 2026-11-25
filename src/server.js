@@ -72,6 +72,8 @@ app.get('/', (req, res) => {
         create: 'POST /api/orders',
         list: 'GET /api/orders',
         detail: 'GET /api/orders/:id',
+        submitReturnPhoto: 'POST /api/orders/:id/return-photo',
+        reviewReturn: 'PATCH /api/orders/:id/return-review',
         updateStatus: 'PATCH /api/orders/:id/status',
       },
       transactions: {

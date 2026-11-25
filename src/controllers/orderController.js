@@ -1,10 +1,17 @@
 const crypto = require('crypto');
 const { supabase } = require('../config/supabase');
+const { storeImage } = require('./uploadController');
 
 /**
  * Direct fallback for creating order when RPC function is not installed in Supabase
  */
-async function createOrderDirect(req, res, { items, dMethod, pMethod, address }) {
+async function createOrderDirect(req, res, {
+  items,
+  dMethod,
+  pMethod,
+  address,
+  rentalDurationDays,
+}) {
   try {
     const client = req.supabase || supabase;
     const userId = req.user.id;
@@ -60,9 +67,16 @@ async function createOrderDirect(req, res, { items, dMethod, pMethod, address })
     const orderId = `#ORD-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
 
     const now = new Date();
-    const dateFormatted = `${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`;
-    const endDate = new Date(now.getTime() + 2 * 24 * 60 * 60 * 1000);
-    const endDateFormatted = `${String(endDate.getDate()).padStart(2, '0')}/${String(endDate.getMonth() + 1).padStart(2, '0')}/${endDate.getFullYear()}`;
+    const jakartaNow = new Date(now.getTime() + 7 * 60 * 60 * 1000);
+    const dateFormatted = `${String(jakartaNow.getUTCDate()).padStart(2, '0')}/${String(jakartaNow.getUTCMonth() + 1).padStart(2, '0')}/${jakartaNow.getUTCFullYear()}`;
+    const endDate = new Date(
+      Date.UTC(
+        jakartaNow.getUTCFullYear(),
+        jakartaNow.getUTCMonth(),
+        jakartaNow.getUTCDate() + rentalDurationDays,
+      ),
+    );
+    const endDateFormatted = `${String(endDate.getUTCDate()).padStart(2, '0')}/${String(endDate.getUTCMonth() + 1).padStart(2, '0')}/${endDate.getUTCFullYear()}`;
     const dateRange = `${dateFormatted} – ${endDateFormatted}`;
 
     let resolvedAddress = address;
@@ -95,6 +109,8 @@ async function createOrderDirect(req, res, { items, dMethod, pMethod, address })
       status: 'active',
       location,
       payment_method: pMethod,
+      rental_duration_days: rentalDurationDays,
+      return_deadline: `${endDate.getUTCFullYear()}-${String(endDate.getUTCMonth() + 1).padStart(2, '0')}-${String(endDate.getUTCDate()).padStart(2, '0')}`,
       created_at: now.toISOString(),
     };
 
@@ -169,6 +185,8 @@ async function createOrder(req, res) {
       delivery_method,
       paymentMethod = 'BCA',
       payment_method,
+      rentalDurationDays,
+      rental_duration_days,
       deliveryAddress,
       delivery_address,
       location,
@@ -177,6 +195,10 @@ async function createOrder(req, res) {
     const dMethod = String(deliveryMethod || delivery_method || 'pickup').toLowerCase();
     const pMethod = paymentMethod || payment_method || 'BCA';
     const address = deliveryAddress || delivery_address || location || null;
+    const durationDays = Number.parseInt(
+      rentalDurationDays ?? rental_duration_days ?? 1,
+      10,
+    );
 
     if (!['pickup', 'delivery'].includes(dMethod)) {
       return res.status(400).json({
@@ -188,6 +210,12 @@ async function createOrder(req, res) {
       return res.status(400).json({
         success: false,
         message: 'Pesanan harus memiliki minimal 1 item.',
+      });
+    }
+    if (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 365) {
+      return res.status(400).json({
+        success: false,
+        message: 'Durasi sewa harus antara 1 sampai 365 hari.',
       });
     }
 
@@ -210,13 +238,20 @@ async function createOrder(req, res) {
       p_delivery_method: dMethod,
       p_payment_method: pMethod,
       p_delivery_address: address,
+      p_rental_duration_days: durationDays,
     });
 
     if (rpcError) {
       const schemaMissing = rpcError.code === 'PGRST202' || rpcError.code === '42883' || rpcError.message?.includes('not find the function');
       if (schemaMissing) {
         console.warn('RPC create_order not found in Supabase. Using resilient direct creation fallback...');
-        return await createOrderDirect(req, res, { items: mappedItems, dMethod, pMethod, address });
+        return await createOrderDirect(req, res, {
+          items: mappedItems,
+          dMethod,
+          pMethod,
+          address,
+          rentalDurationDays: durationDays,
+        });
       }
 
       return res.status(400).json({
@@ -321,6 +356,10 @@ async function getOrders(req, res) {
         status: o.status,
         location: o.location,
         paymentMethod: o.payment_method,
+        rentalDurationDays: o.rental_duration_days || 1,
+        returnDeadline: o.return_deadline,
+        returnPhotoUrl: o.return_photo_url,
+        returnStatus: o.return_status || 'not_submitted',
         createdAt: o.created_at,
         items: orderItems.map((it) => ({
           id: it.id,
@@ -408,6 +447,10 @@ async function getOrderById(req, res) {
         status: data.status,
         location: data.location,
         paymentMethod: data.payment_method,
+        rentalDurationDays: data.rental_duration_days || 1,
+        returnDeadline: data.return_deadline,
+        returnPhotoUrl: data.return_photo_url,
+        returnStatus: data.return_status || 'not_submitted',
         createdAt: data.created_at,
         items: items.map((it) => ({
           id: it.id,
@@ -423,6 +466,123 @@ async function getOrderById(req, res) {
     return res.status(500).json({
       success: false,
       message: 'Terjadi kesalahan pada server.',
+      error: err.message,
+    });
+  }
+}
+
+async function uploadReturnPhoto(req, res) {
+  try {
+    const { id } = req.params;
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        message: 'Pilih foto barang yang akan dikembalikan.',
+      });
+    }
+
+    const client = req.supabase || supabase;
+    const { data: order, error: orderError } = await client
+      .from('orders')
+      .select('id, user_id, status, return_status')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (orderError) {
+      return res.status(400).json({
+        success: false,
+        message: 'Gagal memeriksa pesanan.',
+        error: orderError.message,
+      });
+    }
+    if (!order || order.user_id !== req.user.id) {
+      return res.status(404).json({
+        success: false,
+        message: 'Pesanan tidak ditemukan atau bukan milik Anda.',
+      });
+    }
+    if (order.status !== 'active') {
+      return res.status(400).json({
+        success: false,
+        message: 'Pengembalian hanya dapat diajukan untuk pesanan aktif.',
+      });
+    }
+    if (['pending_review', 'approved'].includes(order.return_status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Foto pengembalian sudah diajukan atau telah dikonfirmasi.',
+      });
+    }
+
+    const { url } = await storeImage(req.file, req, 'return');
+    const { data, error } = await client.rpc('submit_order_return', {
+      p_order_id: id,
+      p_photo_url: url,
+    });
+
+    if (error) {
+      return res.status(400).json({
+        success: false,
+        message: error.message || 'Gagal mengajukan pengembalian.',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: 'Foto pengembalian berhasil dikirim untuk dikonfirmasi petugas.',
+      data,
+    });
+  } catch (err) {
+    console.error('Upload return photo error:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Terjadi kesalahan saat mengirim foto pengembalian.',
+      error: err.message,
+    });
+  }
+}
+
+async function reviewOrderReturn(req, res) {
+  try {
+    const { id } = req.params;
+    const decision = String(req.body.decision || '').toLowerCase();
+    if (!['admin', 'petugas', 'super_admin', 'superadmin'].includes(req.userRole)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Hanya petugas yang dapat mengonfirmasi pengembalian.',
+      });
+    }
+    if (!['approved', 'rejected'].includes(decision)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Keputusan harus approved atau rejected.',
+      });
+    }
+
+    const client = req.supabase || supabase;
+    const { data, error } = await client.rpc('review_order_return', {
+      p_order_id: id,
+      p_decision: decision,
+    });
+    if (error) {
+      return res.status(400).json({
+        success: false,
+        message: error.message || 'Gagal memproses konfirmasi pengembalian.',
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: decision === 'approved'
+        ? 'Pengembalian berhasil dikonfirmasi.'
+        : 'Pengajuan pengembalian ditolak.',
+      data,
+    });
+  } catch (err) {
+    console.error('Review return error:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Terjadi kesalahan saat mengonfirmasi pengembalian.',
       error: err.message,
     });
   }
@@ -508,4 +668,6 @@ module.exports = {
   getOrders,
   getOrderById,
   updateOrderStatus,
+  uploadReturnPhoto,
+  reviewOrderReturn,
 };

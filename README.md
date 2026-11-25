@@ -48,6 +48,11 @@ Format field produk dan entitas database menggunakan format **snake_case** langs
 
 ## 🚀 Memulai (Quick Start)
 
+### Menyiapkan database
+Jalankan `supabase/schema.sql` melalui SQL Editor Supabase sebelum memakai backend.
+Skema ini mencakup durasi sewa, deadline pengembalian, pengajuan foto, dan RPC
+konfirmasi pengembalian.
+
 ### 1. Masuk ke direktori backend
 ```bash
 cd backend
@@ -143,6 +148,7 @@ ditargetkan. Gunakan proyek pengembangan/pengujian, bukan proyek produksi.
       "deliveryMethod": "pickup", // atau "delivery"
       "paymentMethod": "BCA",
       "deliveryAddress": "Jl. Campy No. 1",
+      "rentalDurationDays": 3,
       "items": [
         { "productId": "prod-1", "qty": 1 }
       ]
@@ -150,6 +156,8 @@ ditargetkan. Gunakan proyek pengembangan/pengujian, bukan proyek produksi.
     ```
 - `GET /api/orders` *(Bearer Token)* : Ambil riwayat pesanan (user melihat pesanannya sendiri, staff melihat semua)
 - `GET /api/orders/:id` *(Bearer Token)* : Ambil detail pesanan beserta daftar item
+- `POST /api/orders/:id/return-photo` *(Bearer Token, multipart field `image`)* : Ajukan pengembalian dengan foto oleh pemilik pesanan
+- `PATCH /api/orders/:id/return-review` *(Bearer Token, staff)* : Konfirmasi atau tolak foto pengembalian dengan body `{ "decision": "approved" }` atau `{ "decision": "rejected" }`
 - `PATCH /api/orders/:id/status` *(Bearer Token)* : Ubah status pesanan (`active`, `completed`, `cancelled`)
 
 ### 💳 Transaksi Pembayaran (`/api/transactions`)
